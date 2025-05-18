@@ -11,6 +11,88 @@ const client = new MongoClient(MONGODB_URI)
 // App URL
 const APP_URL = process.env.NEXT_PUBLIC_APP_URL || "https://v0-instaautodm111-eight.vercel.app"
 
+// Function to refresh an Instagram token
+async function refreshInstagramToken(accessToken) {
+  try {
+    const response = await fetch(
+      `https://graph.instagram.com/refresh_access_token?grant_type=ig_refresh_token&access_token=${accessToken}`,
+    )
+
+    if (!response.ok) {
+      const errorData = await response.json()
+      console.error("Failed to refresh token:", errorData)
+      return null
+    }
+
+    const data = await response.json()
+    return {
+      accessToken: data.access_token,
+      expiresIn: data.expires_in,
+    }
+  } catch (error) {
+    console.error("Error refreshing token:", error)
+    return null
+  }
+}
+
+// Function to get a valid token for an account
+async function getValidTokenForAccount(db, accountId) {
+  try {
+    // Get the account
+    const account = await db.collection("instagramAccounts").findOne({ _id: accountId })
+
+    if (!account) {
+      console.error(`Account ${accountId} not found`)
+      return null
+    }
+
+    // Check if token is valid by making a simple API call
+    try {
+      const testResponse = await fetch(
+        `https://graph.instagram.com/me?fields=id,username&access_token=${account.accessToken}`,
+      )
+
+      if (testResponse.ok) {
+        return account.accessToken
+      }
+
+      console.log(`Token for ${account.username} is invalid, attempting to refresh...`)
+    } catch (error) {
+      console.error("Error testing token validity:", error)
+    }
+
+    // Try to refresh the token
+    const refreshResult = await refreshInstagramToken(account.accessToken)
+
+    if (!refreshResult) {
+      console.error(`Failed to refresh token for ${account.username}`)
+      return null
+    }
+
+    // Calculate new expiry date
+    const newExpiryDate = new Date()
+    newExpiryDate.setSeconds(newExpiryDate.getSeconds() + refreshResult.expiresIn)
+
+    // Update the account with new token and expiry
+    await db.collection("instagramAccounts").updateOne(
+      { _id: account._id },
+      {
+        $set: {
+          accessToken: refreshResult.accessToken,
+          expiresAt: newExpiryDate,
+          lastTokenRefresh: new Date(),
+        },
+      },
+    )
+
+    console.log(`Successfully refreshed token for ${account.username}`)
+    return refreshResult.accessToken
+  } catch (error) {
+    console.error("Error getting valid token:", error)
+    return null
+  }
+}
+
 async function checkComments() {
   try {
     console.log("Starting comment check cron job...")
@@ -44,6 +126,17 @@ async function checkComments() {
           console.log(`Instagram account ${automation.instagramAccountId} not found for automation ${automation._id}`)
           continue
         }
+
+        // Get a valid token for this account
+        const validToken = await getValidTokenForAccount(db, instagramAccount._id)
+
+        if (!validToken) {
+          console.error(`No valid token available for account ${instagramAccount.username}`)
+          continue
+        }
+
+        // Update the token in the account object
+        instagramAccount.accessToken = validToken
 
         // For "any post" automations, check all posts from this account
         if (!automation.postId) {
